@@ -317,17 +317,21 @@ def _call_gemini(alert: dict, api_key: str) -> dict:
 
     parsed = _parse_json_safe(raw)
 
-    if "summary" not in parsed or "action_steps" not in parsed:
+    # Treat a missing or non-list action_steps as empty rather than raising —
+    # Gemini sometimes omits it when the content is non-actionable (e.g. clearly
+    # off-topic posts that slipped through classification).
+    if "summary" not in parsed:
         raise ValueError(
             f"Gemini returned unexpected JSON keys: {list(parsed.keys())}. "
-            "Expected 'summary' and 'action_steps'."
+            "Expected at least 'summary'."
         )
-    if not isinstance(parsed["action_steps"], list):
-        raise ValueError("Gemini 'action_steps' field is not a list.")
+    action_steps = parsed.get("action_steps", [])
+    if not isinstance(action_steps, list):
+        action_steps = []
 
     return {
         "summary":      str(parsed["summary"]),
-        "action_steps": [str(s) for s in parsed["action_steps"]],
+        "action_steps": [str(s) for s in action_steps],
     }
 
 
@@ -402,7 +406,7 @@ def _attempt_repair(raw: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — Summarisation
 # ---------------------------------------------------------------------------
 
 def summarize_alert(alert: dict) -> dict:
@@ -449,4 +453,235 @@ def summarize_alert(alert: dict) -> dict:
     except Exception as exc:
         result           = _fallback_summarize(alert)
         result["error"]  = str(exc)
+        return result
+
+# ---------------------------------------------------------------------------
+# Public API — Noise / Signal Classification
+# ---------------------------------------------------------------------------
+
+_CLASSIFY_SYSTEM_PROMPT = textwrap.dedent("""
+    You are a community safety content moderator for the Community Guardian platform.
+
+    Your task is to read a user-submitted safety alert and decide whether it is
+    genuinely useful SIGNAL or should be rejected as NOISE.
+
+    ── SIGNAL — publish it (ALL of these must be true) ──────────────────────
+    • Describes a specific, concrete SAFETY INCIDENT or SECURITY THREAT.
+      Examples: theft, robbery, scam call, phishing SMS, suspicious vehicle,
+      fire hazard, data breach, package theft, break-in attempt.
+    • The incident affects or could affect community members.
+    • Contains at least some verifiable details (location, time, what happened,
+      description of threat/suspect/event).
+
+    ── NOISE — reject it (ANY ONE of these is enough) ───────────────────────
+    • Content about a named or described INDIVIDUAL PERSON that is NOT a safety
+      threat — e.g. gossip, personal opinions about someone's appearance, age,
+      weight, habits, background, education, or relationships.
+    • Personal attacks, insults, mockery, or character descriptions of any person.
+    • Pure emotional venting with no factual safety incident described.
+    • Vague rumours with zero specific details ("I heard something happened").
+    • Spam, advertisements, promotional content, or off-topic posts.
+    • Test submissions, placeholder text, or gibberish.
+    • Panic posts using dramatic language but describing no actual incident.
+    • Fewer than 20 meaningful words of actual safety-relevant content.
+    • Content that describes a person's personal life (diet, education, relationships,
+      physical appearance, career) rather than a safety incident.
+    • Social commentary, complaints about individuals, or workplace/college gossip.
+
+    ── DECISION RULE ────────────────────────────────────────────────────────
+    Ask yourself: "Would a community safety officer act on this information
+    to protect residents?" If the answer is NO, it is noise.
+
+    Do NOT be permissive about personal content. If the post is about a person
+    rather than a safety event, it is always noise regardless of wording.
+
+    Respond with valid JSON only — no markdown, no preamble:
+    {
+      "is_signal": true or false,
+      "label": "signal" | "noise" | "spam" | "venting" | "vague_rumour" | "personal_content" | "duplicate_likely",
+      "reason": "<one sentence explaining the decision>"
+    }
+""").strip()
+
+
+_NOISE_KEYWORDS = [
+    "wtf", "omg", "!!!!", "everyone is talking", "i heard somewhere",
+    "rumour", "rumor", "probably nothing", "just saying", "lol", "lmao",
+    "click here", "buy now", "discount", "offer expires",
+]
+
+# Patterns that indicate personal/gossip content rather than a safety incident.
+# Checked as substrings against the full combined text.
+_PERSONAL_CONTENT_PATTERNS = [
+    "is too old", "is very fat", "is very short", "is an uncle", "is an aunty",
+    "took a year off", "took an year off", "failed a year", "dropped out",
+    "older than", "younger than", "fatter than", "shorter than", "taller than",
+    "my classmate", "my batchmate", "batch mate", "college friend",
+    "my colleague", "my coworker", "my neighbor is", "my neighbour is",
+    "looks ugly", "looks weird", "smells", "is annoying", "is rude",
+    "personal life", "his girlfriend", "her boyfriend", "their relationship",
+    "his weight", "her weight", "his age", "her age",
+]
+
+_SIGNAL_KEYWORDS = [
+    "stolen", "theft", "robbery", "scam", "phishing", "fraud",
+    "suspicious", "break-in", "burglar", "fire", "flood", "accident",
+    "otp", "password", "data breach", "hack", "arrested", "police",
+    "ambulance", "missing", "warning", "alert", "incident",
+]
+
+
+def _fallback_classify(alert: dict) -> dict:
+    """
+    Rule-based classification fallback — no AI required.
+
+    Rules (in priority order):
+    1. Too short (< 15 words of report text) → noise
+    2. Contains personal-content patterns → noise/personal_content
+    3. Contains noise keywords → noise/spam/venting
+    4. Contains signal keywords → signal
+    5. Default → signal (permissive — only personal/spam content is blocked)
+    """
+    report = alert.get("report_text", "").strip()
+    title  = alert.get("title", "").strip()
+    combined_lower = (title + " " + report).lower()
+    word_count = len(report.split())
+
+    if word_count < 15:
+        return {
+            "is_signal": False,
+            "label":     "noise",
+            "reason":    f"Report is too short ({word_count} words) to contain actionable information.",
+            "source":    "fallback",
+        }
+
+    # Personal content check — highest priority noise gate
+    for pattern in _PERSONAL_CONTENT_PATTERNS:
+        if pattern in combined_lower:
+            return {
+                "is_signal": False,
+                "label":     "personal_content",
+                "reason":    f"Content describes a person rather than a safety incident (matched: '{pattern}').",
+                "source":    "fallback",
+            }
+
+    for kw in _NOISE_KEYWORDS:
+        if kw in combined_lower:
+            return {
+                "is_signal": False,
+                "label":     "spam" if kw in ("click here", "buy now", "discount", "offer expires") else "venting",
+                "reason":    f"Contains noise indicator: '{kw}'.",
+                "source":    "fallback",
+            }
+
+    for kw in _SIGNAL_KEYWORDS:
+        if kw in combined_lower:
+            return {
+                "is_signal": True,
+                "label":     "signal",
+                "reason":    f"Contains actionable safety keyword: '{kw}'.",
+                "source":    "fallback",
+            }
+
+    # Default permissive: if no noise triggers, treat as signal
+    return {
+        "is_signal": True,
+        "label":     "signal",
+        "reason":    "No noise indicators found; treated as signal by default.",
+        "source":    "fallback",
+    }
+
+
+def classify_alert(alert: dict) -> dict:
+    """
+    Classify a user-submitted alert as signal or noise using Gemini.
+
+    This runs BEFORE saving the alert. If the result is noise the UI
+    rejects the submission with the reason shown to the user.
+
+    Args:
+        alert: the complete alert dict (from build_new_alert)
+
+    Returns:
+        {
+            "is_signal": bool,
+            "label":     str,   e.g. "signal", "noise", "spam", "venting"
+            "reason":    str,   one-sentence explanation
+            "source":    "AI" | "fallback",
+            "error":     str | None
+        }
+    """
+    report_text = alert.get("report_text", "").strip()
+    if not report_text:
+        return {
+            "is_signal": False,
+            "label":     "noise",
+            "reason":    "No report text was provided.",
+            "source":    "fallback",
+            "error":     None,
+        }
+
+    api_key = _get_api_key()
+    if not api_key:
+        result = _fallback_classify(alert)
+        result["error"] = "GEMINI_API_KEY not set — using rule-based classification."
+        return result
+
+    try:
+        import google.generativeai as genai
+
+        category    = alert.get("category", "").replace("_", " ")
+        subcategory = alert.get("subcategory", "").replace("_", " ")
+        location    = ", ".join(
+            p for p in [alert.get("neighborhood", ""), alert.get("location_city", "")] if p
+        ) or "Unknown"
+
+        user_prompt = textwrap.dedent(f"""
+            USER-SUBMITTED ALERT
+            --------------------
+            Title    : {alert.get("title", "Untitled")}
+            Category : {category}{" / " + subcategory if subcategory else ""}
+            Location : {location}
+            Severity : {alert.get("severity", 3)}/5
+
+            REPORT TEXT
+            -----------
+            {report_text}
+        """).strip()
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name=_MODEL_NAME,
+            system_instruction=_CLASSIFY_SYSTEM_PROMPT,
+        )
+        response = model.generate_content(
+            user_prompt,
+            generation_config={
+                "temperature": 0.1,      # very low — classification should be deterministic
+                "max_output_tokens": 256,
+                "response_mime_type": "application/json",
+            },
+        )
+        raw = response.text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw)
+            raw = re.sub(r"\n?```$",        "", raw)
+
+        parsed = _parse_json_safe(raw)
+
+        # Validate expected keys
+        if "is_signal" not in parsed:
+            raise ValueError(f"Missing 'is_signal' key in response: {list(parsed.keys())}")
+
+        return {
+            "is_signal": bool(parsed["is_signal"]),
+            "label":     str(parsed.get("label", "signal" if parsed["is_signal"] else "noise")),
+            "reason":    str(parsed.get("reason", "—")),
+            "source":    "AI",
+            "error":     None,
+        }
+
+    except Exception as exc:
+        result = _fallback_classify(alert)
+        result["error"] = str(exc)
         return result

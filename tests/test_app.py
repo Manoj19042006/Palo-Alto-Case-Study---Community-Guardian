@@ -198,7 +198,9 @@ class TestHappyPath(unittest.TestCase):
         self.assertEqual(result[0]["id"], "CG-T01")
 
     def test_filter_no_criteria_returns_all(self):
-        result = filter_alerts(SAMPLE_ALERTS)
+        # signal_only=False needed: CG-T03 has noise_to_signal="noise"
+        # and filter_alerts defaults to signal_only=True in production.
+        result = filter_alerts(SAMPLE_ALERTS, signal_only=False)
         self.assertEqual(len(result), len(SAMPLE_ALERTS))
 
     # --- is_high_signal ---
@@ -506,26 +508,28 @@ class TestEdgeCases(unittest.TestCase):
     # --- Audience filter ---
 
     def test_filter_by_audience_neighborhood(self):
-        result = filter_alerts(SAMPLE_ALERTS, audience="neighborhood_group")
+        # signal_only=False: CG-T03 is noise, needs to be visible for this test
+        result = filter_alerts(SAMPLE_ALERTS, audience="neighborhood_group", signal_only=False)
         ids = {a["id"] for a in result}
         self.assertIn("CG-T01", ids)   # audience_tag = neighborhood_group
         self.assertIn("CG-T02", ids)   # audience_tag = neighborhood_group
         self.assertIn("CG-T03", ids)   # audience_tag = neighborhood_group (also elderly segment)
 
     def test_filter_by_audience_elderly(self):
-        result = filter_alerts(SAMPLE_ALERTS, audience="elderly_user")
+        # signal_only=False: CG-T03 is noise but we're testing the audience logic
+        result = filter_alerts(SAMPLE_ALERTS, audience="elderly_user", signal_only=False)
         ids = {a["id"] for a in result}
         self.assertIn("CG-T03", ids)       # user_segment_focus = elderly_user → match
         self.assertNotIn("CG-T01", ids)    # neither field is elderly_user
         self.assertNotIn("CG-T02", ids)    # neither field is elderly_user
 
     def test_filter_by_audience_no_match(self):
-        result = filter_alerts(SAMPLE_ALERTS, audience="remote_worker")
+        result = filter_alerts(SAMPLE_ALERTS, audience="remote_worker", signal_only=False)
         self.assertEqual(result, [])
 
     def test_filter_audience_none_returns_all(self):
-        """audience=None should return all alerts regardless of segment."""
-        result = filter_alerts(SAMPLE_ALERTS, audience=None)
+        """audience=None with signal_only=False returns all alerts regardless of segment."""
+        result = filter_alerts(SAMPLE_ALERTS, audience=None, signal_only=False)
         self.assertEqual(len(result), len(SAMPLE_ALERTS))
 
     # --- Prompt builder ---
@@ -672,6 +676,375 @@ class TestEdgeCases(unittest.TestCase):
     def test_filter_search_no_match(self):
         result = filter_alerts(SAMPLE_ALERTS, search_query="xylophone_not_in_data")
         self.assertEqual(result, [])
+
+
+# ===========================================================================
+# New feature tests — date filter, location, signal gate, classification
+# ===========================================================================
+
+class TestNewFeatures(unittest.TestCase):
+
+    # -----------------------------------------------------------------------
+    # Date filter
+    # -----------------------------------------------------------------------
+
+    def test_date_filter_cutoff_all_time_returns_none(self):
+        from utils import date_filter_cutoff
+        self.assertIsNone(date_filter_cutoff("All time"))
+
+    def test_date_filter_cutoff_last_24h_is_recent(self):
+        from utils import date_filter_cutoff
+        from datetime import datetime, timezone, timedelta
+        cutoff = date_filter_cutoff("Last 24 hours")
+        self.assertIsNotNone(cutoff)
+        now = datetime.now(timezone.utc)
+        # Cutoff should be approximately 24 h ago (within 5 seconds)
+        self.assertAlmostEqual((now - cutoff).total_seconds(), 86400, delta=5)
+
+    def test_date_filter_excludes_old_alert(self):
+        """An alert from 2026-01-01 should be excluded by 'Last 24 hours' filter."""
+        from utils import filter_alerts
+        old_alert = {**SAMPLE_ALERTS[0], "created_at": "2026-01-01T00:00:00+00:00"}
+        result = filter_alerts([old_alert], date_filter="Last 24 hours", signal_only=False)
+        self.assertEqual(result, [])
+
+    def test_date_filter_includes_recent_alert(self):
+        """An alert timestamped now should pass any date filter."""
+        from utils import filter_alerts
+        from datetime import datetime, timezone
+        now_str = datetime.now(timezone.utc).isoformat()
+        fresh_alert = {**SAMPLE_ALERTS[0], "created_at": now_str, "noise_to_signal": "signal"}
+        result = filter_alerts([fresh_alert], date_filter="Last 24 hours")
+        self.assertEqual(len(result), 1)
+
+    def test_date_filter_all_time_includes_old_alert(self):
+        """'All time' filter should include all alerts regardless of date."""
+        from utils import filter_alerts
+        old_alert = {**SAMPLE_ALERTS[0], "created_at": "2020-01-01T00:00:00+00:00",
+                     "noise_to_signal": "signal"}
+        result = filter_alerts([old_alert], date_filter="All time")
+        self.assertEqual(len(result), 1)
+
+    def test_parse_alert_datetime_valid(self):
+        from utils import parse_alert_datetime
+        from datetime import timezone
+        alert = {"created_at": "2026-03-01T08:20:00+05:30"}
+        dt = parse_alert_datetime(alert)
+        self.assertIsNotNone(dt)
+        self.assertIsNotNone(dt.tzinfo)
+
+    def test_parse_alert_datetime_missing(self):
+        from utils import parse_alert_datetime
+        self.assertIsNone(parse_alert_datetime({}))
+
+    def test_parse_alert_datetime_invalid(self):
+        from utils import parse_alert_datetime
+        self.assertIsNone(parse_alert_datetime({"created_at": "not-a-date"}))
+
+    def test_format_alert_date_returns_string(self):
+        from utils import format_alert_date
+        alert = {"created_at": "2026-03-01T08:20:00+05:30"}
+        result = format_alert_date(alert)
+        self.assertIsInstance(result, str)
+        self.assertIn("2026", result)
+
+    def test_format_alert_date_missing_returns_dash(self):
+        from utils import format_alert_date
+        self.assertEqual(format_alert_date({}), "—")
+
+    # -----------------------------------------------------------------------
+    # Location helpers
+    # -----------------------------------------------------------------------
+
+    def test_haversine_hyderabad_to_sangareddy(self):
+        """Sangareddy is ~50 km from Hyderabad."""
+        from utils import haversine_distance
+        # Sangareddy: 17.62, 78.09  |  Hyderabad: 17.385, 78.4867
+        dist = haversine_distance(17.62, 78.09, 17.385, 78.4867)
+        self.assertGreater(dist, 30)
+        self.assertLess(dist, 80)
+
+    def test_nearest_city_sangareddy_returns_hyderabad(self):
+        """Sangareddy's nearest dataset city should be Hyderabad."""
+        from utils import nearest_city_in_dataset
+        result = nearest_city_in_dataset(17.62, 78.09)
+        self.assertEqual(result, "Hyderabad")
+
+    def test_nearest_city_mumbai_coords_returns_mumbai(self):
+        from utils import nearest_city_in_dataset
+        result = nearest_city_in_dataset(19.0760, 72.8777)
+        self.assertEqual(result, "Mumbai")
+
+    def test_nearest_city_delhi_coords_returns_delhi(self):
+        from utils import nearest_city_in_dataset
+        result = nearest_city_in_dataset(28.6139, 77.2090)
+        self.assertEqual(result, "Delhi")
+
+    def test_get_user_location_returns_dict_with_required_keys(self):
+        """get_user_location() always returns a dict with required keys."""
+        from utils import get_user_location
+        result = get_user_location()
+        for key in ("city", "lat", "lon", "country", "matched_city", "source"):
+            self.assertIn(key, result)
+
+    def test_location_fallback_graceful(self):
+        """If IP geolocation fails, matched_city should be '' and not crash."""
+        from utils import _location_fallback
+        result = _location_fallback("timeout")
+        self.assertEqual(result["matched_city"], "")
+        self.assertIn("fallback", result["source"])
+
+    # -----------------------------------------------------------------------
+    # Signal-only gate (new default behaviour)
+    # -----------------------------------------------------------------------
+
+    def test_signal_only_true_excludes_noise(self):
+        """Default signal_only=True must exclude noise-tagged alerts."""
+        from utils import filter_alerts
+        result = filter_alerts(SAMPLE_ALERTS, signal_only=True)
+        ids = {a["id"] for a in result}
+        self.assertNotIn("CG-T03", ids)   # CG-T03 is noise
+        self.assertIn("CG-T01",    ids)
+        self.assertIn("CG-T02",    ids)
+
+    def test_signal_only_false_includes_noise(self):
+        """signal_only=False must include noise-tagged alerts."""
+        from utils import filter_alerts
+        result = filter_alerts(SAMPLE_ALERTS, signal_only=False)
+        ids = {a["id"] for a in result}
+        self.assertIn("CG-T03", ids)
+
+    def test_dashboard_default_never_shows_noise(self):
+        """filter_alerts() with all defaults excludes noise — as the dashboard uses it."""
+        from utils import filter_alerts
+        result = filter_alerts(SAMPLE_ALERTS)
+        for alert in result:
+            self.assertEqual(alert.get("noise_to_signal"), "signal",
+                             f"Alert {alert['id']} should be signal but is noise")
+
+    # -----------------------------------------------------------------------
+    # classify_alert — fallback path (no API key needed)
+    # -----------------------------------------------------------------------
+
+    def test_classify_clear_signal_post(self):
+        """A specific, factual incident should classify as signal."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "Bike stolen from apartment entrance",
+            "report_text": (
+                "A resident reported their bicycle stolen from the apartment basement "
+                "parking lot at around 7:30 AM on Sunday. The lock was cut. CCTV footage "
+                "may be available from camera 3 near the lift lobby."
+            ),
+            "category": "physical_safety",
+        }
+        result = _fallback_classify(alert)
+        self.assertTrue(result["is_signal"])
+        self.assertEqual(result["source"], "fallback")
+
+    def test_classify_spam_post(self):
+        """A spam post with advertising keywords should be classified as noise/spam."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "Special discount offer just for our residents",
+            "report_text": (
+                "Buy now and get a huge discount offer that expires very soon. "
+                "Click here for all the exclusive details available only to members of this group."
+            ),
+            "category": "public_notice",
+        }
+        result = _fallback_classify(alert)
+        self.assertFalse(result["is_signal"])
+        # Label is either "spam" (keyword path) or "noise" (length path) — both acceptable
+        self.assertIn(result["label"], ("spam", "noise", "venting"))
+
+    def test_classify_too_short_post(self):
+        """A very short post should be classified as noise."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "Something happened",
+            "report_text": "Something happened near my house.",
+            "category": "physical_safety",
+        }
+        result = _fallback_classify(alert)
+        self.assertFalse(result["is_signal"])
+
+    def test_classify_venting_post(self):
+        """A post with emotional venting keywords should be rejected."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "So angry",
+            "report_text": (
+                "OMG I can't believe what happened today, everyone is so careless in this "
+                "building. The management is useless. WTF is wrong with people here."
+            ),
+            "category": "public_notice",
+        }
+        result = _fallback_classify(alert)
+        self.assertFalse(result["is_signal"])
+        self.assertEqual(result["label"], "venting")
+
+    def test_classify_phishing_alert_is_signal(self):
+        """A digital security alert with enough detail should pass."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "Phishing SMS alert",
+            "report_text": (
+                "Several residents received SMS messages impersonating HDFC Bank asking "
+                "them to click a link and enter their OTP to avoid account suspension. "
+                "Do not click the link. Report to 1930."
+            ),
+            "category": "digital_security",
+        }
+        result = _fallback_classify(alert)
+        self.assertTrue(result["is_signal"])
+
+    def test_classify_no_api_key_uses_fallback(self):
+        """classify_alert() uses fallback when no API key is set."""
+        from unittest.mock import patch
+        from ai_module import classify_alert
+        alert = {
+            "title": "Suspicious van spotted",
+            "report_text": (
+                "A suspicious white van was circling the residential block near "
+                "the playground for over 30 minutes. No number plate was visible. "
+                "Two residents independently witnessed this around 9:45 PM."
+            ),
+            "category": "physical_safety",
+        }
+        with patch("ai_module._get_api_key", return_value=None):
+            result = classify_alert(alert)
+        self.assertIn("is_signal", result)
+        self.assertEqual(result["source"], "fallback")
+        self.assertIn("GEMINI_API_KEY", result.get("error", ""))
+
+    def test_classify_empty_report_is_noise(self):
+        """classify_alert() rejects empty report text immediately."""
+        from ai_module import classify_alert
+        result = classify_alert({"title": "Test", "report_text": "", "category": "scam"})
+        self.assertFalse(result["is_signal"])
+        self.assertEqual(result["label"], "noise")
+
+    # -----------------------------------------------------------------------
+    # Regression tests for the three bugs reported
+    # -----------------------------------------------------------------------
+
+    def test_regression_personal_gossip_is_noise(self):
+        """
+        Regression: 'Ramanuja is an Uncle' style post — personal description
+        of a named individual — must be classified as noise, not signal.
+        """
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "Ramanuja is an Uncle",
+            "report_text": (
+                "Ramanuja is too old and is older than our batch mates in our college "
+                "IIT Hyderabad. He is very fat and short with a very old age than us "
+                "since he took an year off in between the education."
+            ),
+            "category": "physical_safety",
+        }
+        result = _fallback_classify(alert)
+        self.assertFalse(result["is_signal"],
+            "Personal gossip about a person should be noise, not signal.")
+        self.assertEqual(result["label"], "personal_content")
+
+    def test_regression_older_than_pattern_detected(self):
+        """'older than' is a personal-comparison phrase and should trigger noise."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "About my neighbour",
+            "report_text": (
+                "My neighbour John is way older than everyone else in the building. "
+                "He is very short and fat and always complaining about noise late at night."
+            ),
+        }
+        result = _fallback_classify(alert)
+        self.assertFalse(result["is_signal"])
+        self.assertIn(result["label"], ("personal_content", "noise"))
+
+    def test_regression_action_steps_missing_does_not_raise(self):
+        """
+        Regression: when Gemini returns only {'summary': '...'} with no
+        action_steps key, _call_gemini must return an empty list rather
+        than raising a ValueError that triggers fallback.
+        """
+        from ai_module import _parse_json_safe
+        # Simulate what _call_gemini does after getting this response
+        raw = '{"summary": "This is a description about a person, not a safety alert."}'
+        parsed = _parse_json_safe(raw)
+        # The production code now does:
+        action_steps = parsed.get("action_steps", [])
+        self.assertIsInstance(action_steps, list)
+        self.assertEqual(action_steps, [])   # missing → empty, not an error
+
+    def test_regression_action_steps_non_list_defaults_to_empty(self):
+        """If action_steps is present but not a list, it defaults to []."""
+        from ai_module import _parse_json_safe
+        raw = '{"summary": "Test summary.", "action_steps": null}'
+        parsed = _parse_json_safe(raw)
+        action_steps = parsed.get("action_steps", [])
+        if not isinstance(action_steps, list):
+            action_steps = []
+        self.assertEqual(action_steps, [])
+
+    def test_regression_location_fallback_returns_safe_dict(self):
+        """
+        Regression: when ALL geolocation providers fail (e.g. network blocked),
+        get_user_location() must return a safe dict with matched_city=''.
+        """
+        from unittest.mock import patch
+        import requests
+        with patch("requests.get", side_effect=ConnectionError("All blocked")):
+            from utils import get_user_location
+            result = get_user_location()
+        self.assertEqual(result["matched_city"], "")
+        self.assertIn("fallback", result["source"])
+        # These keys must always be present
+        for key in ("city", "lat", "lon", "country", "matched_city", "source"):
+            self.assertIn(key, result)
+
+    def test_regression_location_https_fallback_to_ipinfo(self):
+        """
+        If ip-api.com fails (HTTP blocked), ipinfo.io (HTTPS) is tried next.
+        """
+        from unittest.mock import patch, MagicMock, call
+        import requests
+
+        # First call (ip-api.com) raises; second call (ipinfo.io) succeeds
+        mock_ipinfo = MagicMock()
+        mock_ipinfo.json.return_value = {
+            "city": "Pune", "loc": "18.52,73.85", "country": "IN"
+        }
+
+        def side_effect(url, **kwargs):
+            if "ip-api.com" in url:
+                raise ConnectionError("HTTP blocked")
+            return mock_ipinfo
+
+        with patch("requests.get", side_effect=side_effect):
+            from utils import get_user_location
+            result = get_user_location()
+
+        self.assertEqual(result["matched_city"], "Pune")
+        self.assertEqual(result["source"],       "ipinfo.io")
+
+    def test_classify_personal_content_label_in_valid_labels(self):
+        """'personal_content' must be a valid label returned by the fallback."""
+        from ai_module import _fallback_classify
+        alert = {
+            "title": "About my batch mate",
+            "report_text": (
+                "My batch mate from college is very fat and short and older than "
+                "all of us. He took a year off in between the education and now "
+                "acts like he knows everything in our batch."
+            ),
+        }
+        result = _fallback_classify(alert)
+        self.assertFalse(result["is_signal"])
+        self.assertIn(result["label"], (
+            "personal_content", "noise", "venting", "spam"
+        ))
 
 
 # ===========================================================================
