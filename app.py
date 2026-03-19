@@ -270,51 +270,62 @@ if page == "📊 Dashboard":
             with st.expander("📄 Full Report Text", expanded=True):
                 st.write(chosen.get("report_text", "No text available."))
 
-            # --- AI Summary ---
-            st.subheader("🤖 AI Insights")
-            alert_id = chosen.get("id", "")
+        # -----------------------------
+        # 🔥 FIXED: AI ALWAYS AVAILABLE
+        # -----------------------------
+        st.subheader("🤖 AI Insights")
 
-            col_btn, col_src = st.columns([3, 1])
-            with col_btn:
-                run_ai = st.button(
-                    "✨ Generate Summary & Action Steps",
-                    key=f"ai_{alert_id}",
-                )
+        if not can_view_alert(chosen, viewer_role="public"):
+            st.info("🔐 Sensitive alert. AI summary generated without exposing full details.")
 
-            if run_ai or alert_id in st.session_state.ai_cache:
-                if run_ai:
-                    with st.spinner("Thinking…"):
-                        result = summarize_alert(
-                            chosen.get("report_text", ""),
-                            chosen.get("category", ""),
-                        )
-                    st.session_state.ai_cache[alert_id] = result
+        alert_id = chosen.get("id", "")
 
-                cached = st.session_state.ai_cache.get(alert_id, {})
-                src = cached.get("source", "fallback")
-                badge_cls = "badge-ai" if src == "AI" else "badge-fallback"
-                badge_label = "🤖 Gemini AI" if src == "AI" else "🔧 Rule-based Fallback"
+        col_btn, col_src = st.columns([3, 1])
+        with col_btn:
+            run_ai = st.button(
+                "✨ Generate Summary & Action Steps",
+                key=f"ai_{alert_id}",
+            )
 
-                st.markdown(
-                    f'<span class="{badge_cls}">{badge_label}</span>',
-                    unsafe_allow_html=True,
-                )
+        if run_ai or alert_id in st.session_state.ai_cache:
+            if run_ai:
+                with st.spinner("Thinking…"):
+                    result = summarize_alert(
+                        chosen.get("report_text", ""),
+                        chosen.get("category", ""),
+                    )
+                st.session_state.ai_cache[alert_id] = result
 
-                col_sum, col_act = st.columns(2)
-                with col_sum:
-                    st.markdown("**📝 Summary**")
-                    st.info(cached.get("summary", "—"))
+            cached = st.session_state.ai_cache.get(alert_id, {})
+            src = cached.get("source", "fallback")
 
-                with col_act:
-                    st.markdown("**✅ Action Steps**")
-                    for step in cached.get("action_steps", []):
-                        st.markdown(f"- {step}")
+            badge_cls = "badge-ai" if src == "AI" else "badge-fallback"
+            badge_label = "🤖 Gemini AI" if src == "AI" else "🔧 Rule-based Fallback"
 
-            # Dataset-provided action steps
-            if chosen.get("action_steps"):
-                with st.expander("📋 Dataset Action Steps"):
-                    for step in chosen.get("action_steps", []):
-                        st.markdown(f"- {step}")
+            st.markdown(
+                f'<span class="{badge_cls}">{badge_label}</span>',
+                unsafe_allow_html=True,
+            )
+
+            # 🔥 NEW: explicit fallback explanation
+            if src == "fallback":
+                st.info("⚠️ AI unavailable or low-confidence. Showing rule-based guidance.")
+
+            col_sum, col_act = st.columns(2)
+            with col_sum:
+                st.markdown("**📝 Summary**")
+                st.info(cached.get("summary", "—"))
+
+            with col_act:
+                st.markdown("**✅ Action Steps**")
+                for step in cached.get("action_steps", []):
+                    st.markdown(f"- {step}")
+
+        # Dataset-provided action steps
+        if chosen.get("action_steps"):
+            with st.expander("📋 Dataset Action Steps"):
+                for step in chosen.get("action_steps", []):
+                    st.markdown(f"- {step}")
 
 # ---------------------------------------------------------------------------
 # Page: ADD ALERT

@@ -159,20 +159,6 @@ _SYSTEM_PROMPT = textwrap.dedent("""
 
 
 def summarize_alert(report_text: str, category: str = "") -> dict:
-    """
-    Summarize an alert using Gemini API, with automatic fallback.
-
-    Args:
-        report_text: The raw alert description.
-        category: Optional category hint (helps fallback logic).
-
-    Returns:
-        {
-            "summary": str,
-            "action_steps": list[str],
-            "source": "AI" | "fallback"
-        }
-    """
     if not report_text or not report_text.strip():
         return {
             "summary": "No report text available.",
@@ -180,17 +166,24 @@ def summarize_alert(report_text: str, category: str = "") -> dict:
             "source": "fallback",
         }
 
-    # Try Gemini
     if _API_KEY:
         try:
             result = _call_gemini(report_text)
+
+            # 🔥 FIX: validate AI output before accepting it
+            if (
+                not result.get("summary")
+                or len(result.get("summary", "").strip()) < 10
+                or not result.get("action_steps")
+            ):
+                raise ValueError("Weak AI response")
+
             result["source"] = "AI"
             return result
+
         except Exception:
-            # Gracefully fall through to rule-based fallback
             pass
 
-    # Rule-based fallback
     return _fallback_summarize(report_text, category)
 
 
