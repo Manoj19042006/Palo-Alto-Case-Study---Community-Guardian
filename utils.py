@@ -21,6 +21,20 @@ VALID_CATEGORIES = [
     "safe_circle",
 ]
 
+VALID_AUDIENCES = [
+    "neighborhood_group",
+    "remote_worker",
+    "elderly_user",
+    "general",
+]
+
+AUDIENCE_LABELS = {
+    "neighborhood_group": "🏘️ Neighborhood Group",
+    "remote_worker":      "💻 Remote Worker",
+    "elderly_user":       "👴 Elderly User",
+    "general":            "👥 General",
+}
+
 PRIVACY_LABELS = {
     "public_digest": "🌐 Public",
     "private_circle": "🔒 Private Circle",
@@ -83,6 +97,7 @@ def filter_alerts(
     *,
     category: Optional[str] = None,
     city: Optional[str] = None,
+    audience: Optional[str] = None,
     severity_min: int = 1,
     severity_max: int = 5,
     high_signal_only: bool = False,
@@ -95,6 +110,7 @@ def filter_alerts(
         alerts: raw list of alert dicts
         category: exact category match (None = all)
         city: exact city match (None = all)
+        audience: match against audience_tag or user_segment_focus (None = all)
         severity_min / severity_max: inclusive severity range 1–5
         high_signal_only: if True, exclude noise/low-reliability alerts
         search_query: case-insensitive substring search over title + report_text
@@ -117,6 +133,15 @@ def filter_alerts(
         # City filter
         if city and alert.get("location_city") != city:
             continue
+
+        # Audience filter — alert qualifies if either audience_tag OR user_segment_focus matches.
+        # An alert can be posted in a neighborhood group (audience_tag) but specifically
+        # focused on elderly users (user_segment_focus); it should appear under both filters.
+        if audience:
+            tag     = alert.get("audience_tag", "")
+            segment = alert.get("user_segment_focus", "")
+            if audience not in (tag, segment):
+                continue
 
         # Severity range
         sev = int(alert.get("severity", 1))
@@ -214,6 +239,15 @@ def validate_new_alert(data: dict) -> list[str]:
 
 def build_new_alert(data: dict) -> dict:
     """Build a complete alert dict from validated form data."""
+    # Parse user-submitted action steps: newline or comma separated string → list
+    raw_steps = data.get("user_action_steps", "") or ""
+    if isinstance(raw_steps, str):
+        # Split on newlines first, then commas, strip and drop blanks
+        lines = [s.strip() for line in raw_steps.splitlines() for s in line.split(",")]
+        parsed_steps = [s for s in lines if s]
+    else:
+        parsed_steps = list(raw_steps)
+
     return {
         "id": f"CG-{uuid.uuid4().hex[:6].upper()}",
         "record_type": "alert",
@@ -237,7 +271,7 @@ def build_new_alert(data: dict) -> dict:
         "needs_actionable_digest": True,
         "ai_task": "summarize",
         "recommended_action_type": "safety_tip",
-        "action_steps": [],
+        "action_steps": parsed_steps,   # user-provided steps stored here
         "safe_circle_recommended": False,
         "privacy_mode": data.get("privacy_mode", "public_digest"),
         "encrypted_update": False,

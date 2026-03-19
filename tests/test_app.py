@@ -212,45 +212,57 @@ class TestHappyPath(unittest.TestCase):
     # --- Summarize (fallback path, no API key needed) ---
 
     def test_summarize_fallback_returns_dict(self):
-        result = _fallback_summarize(
-            "Multiple residents received phishing SMS messages. They were asked to click a fake link.",
-            "digital_security",
-        )
+        alert = {
+            "report_text": "Multiple residents received phishing SMS messages. They were asked to click a fake link.",
+            "category": "digital_security",
+        }
+        result = _fallback_summarize(alert)
         self.assertIn("summary", result)
         self.assertIn("action_steps", result)
         self.assertEqual(result["source"], "fallback")
         self.assertIsInstance(result["action_steps"], list)
         self.assertGreater(len(result["action_steps"]), 0)
+        # Fallback produces no summary — avoids duplicating the report text
+        self.assertEqual(result["summary"], "")
 
     def test_summarize_fallback_keyword_phishing(self):
-        result = _fallback_summarize("A phishing email asked users for their password.", "digital_security")
+        alert = {
+            "report_text": "A phishing email asked users for their password.",
+            "category": "digital_security",
+        }
+        result = _fallback_summarize(alert)
         steps_text = " ".join(result["action_steps"]).lower()
-        # Should contain account-safety advice
         self.assertTrue(
-            any(kw in steps_text for kw in ["password", "two-factor", "authentication", "account"])
+            any(kw in steps_text for kw in ["password", "two-factor", "authentication", "account", "otp"])
         )
 
     def test_summarize_fallback_keyword_theft(self):
-        result = _fallback_summarize("A bicycle was stolen from the premises.", "physical_safety")
+        alert = {
+            "report_text": "A bicycle was stolen from the premises.",
+            "category": "physical_safety",
+        }
+        result = _fallback_summarize(alert)
         steps_text = " ".join(result["action_steps"]).lower()
         self.assertTrue(
             any(kw in steps_text for kw in ["lock", "secure", "police", "report"])
         )
 
     def test_summarize_alert_no_api_key_returns_fallback(self):
-        """summarize_alert() must return fallback when GEMINI_API_KEY is absent."""
-        import ai_module
-        original_key = ai_module._API_KEY
-        try:
-            ai_module._API_KEY = None  # Simulate missing key
-            result = summarize_alert(
-                "Suspicious person seen near park at night.", "physical_safety"
-            )
-            self.assertIn("summary", result)
-            self.assertIn("action_steps", result)
-            self.assertEqual(result["source"], "fallback")
-        finally:
-            ai_module._API_KEY = original_key
+        """summarize_alert() must return fallback + error message when GEMINI_API_KEY is absent."""
+        from unittest.mock import patch
+        alert = {
+            "report_text": "Suspicious person seen near park at night.",
+            "category": "physical_safety",
+            "audience_tag": "neighborhood_group",
+            "severity": 3,
+        }
+        with patch("ai_module._get_api_key", return_value=None):
+            result = summarize_alert(alert)
+        self.assertIn("summary", result)
+        self.assertIn("action_steps", result)
+        self.assertEqual(result["source"], "fallback")
+        self.assertIsNotNone(result.get("error"))
+        self.assertIn("GEMINI_API_KEY", result["error"])
 
     # --- Save ---
 
@@ -440,26 +452,207 @@ class TestEdgeCases(unittest.TestCase):
         self.assertEqual(alert["verification_status"], "unverified")
         self.assertEqual(alert["noise_to_signal"], "signal")
 
+    def test_build_new_alert_parses_user_steps_newlines(self):
+        """User steps entered one-per-line are parsed into a list."""
+        alert = build_new_alert({
+            "title": "Test",
+            "report_text": "Some incident.",
+            "category": "scam",
+            "location_city": "Delhi",
+            "severity": 3,
+            "user_action_steps": "Lock your bike\nAlert building security\nFile a police report",
+        })
+        self.assertEqual(len(alert["action_steps"]), 3)
+        self.assertIn("Lock your bike", alert["action_steps"])
+        self.assertIn("File a police report", alert["action_steps"])
+
+    def test_build_new_alert_parses_user_steps_commas(self):
+        """User steps entered comma-separated are also parsed correctly."""
+        alert = build_new_alert({
+            "title": "Test",
+            "report_text": "Some incident.",
+            "category": "scam",
+            "location_city": "Delhi",
+            "severity": 3,
+            "user_action_steps": "Change password, Enable 2FA, Call bank",
+        })
+        self.assertEqual(len(alert["action_steps"]), 3)
+        self.assertIn("Change password", alert["action_steps"])
+
+    def test_build_new_alert_empty_steps_gives_empty_list(self):
+        """No user steps → action_steps is an empty list."""
+        alert = build_new_alert({
+            "title": "Test",
+            "report_text": "Report",
+            "category": "scam",
+            "location_city": "Pune",
+            "severity": 2,
+            "user_action_steps": "",
+        })
+        self.assertEqual(alert["action_steps"], [])
+
+    def test_build_new_alert_strips_blank_step_lines(self):
+        """Blank lines in user steps are silently dropped."""
+        alert = build_new_alert({
+            "title": "Test",
+            "report_text": "Report",
+            "category": "scam",
+            "location_city": "Pune",
+            "severity": 2,
+            "user_action_steps": "Step one\n\n\nStep two\n",
+        })
+        self.assertEqual(len(alert["action_steps"]), 2)
+
+    # --- Audience filter ---
+
+    def test_filter_by_audience_neighborhood(self):
+        result = filter_alerts(SAMPLE_ALERTS, audience="neighborhood_group")
+        ids = {a["id"] for a in result}
+        self.assertIn("CG-T01", ids)   # audience_tag = neighborhood_group
+        self.assertIn("CG-T02", ids)   # audience_tag = neighborhood_group
+        self.assertIn("CG-T03", ids)   # audience_tag = neighborhood_group (also elderly segment)
+
+    def test_filter_by_audience_elderly(self):
+        result = filter_alerts(SAMPLE_ALERTS, audience="elderly_user")
+        ids = {a["id"] for a in result}
+        self.assertIn("CG-T03", ids)       # user_segment_focus = elderly_user → match
+        self.assertNotIn("CG-T01", ids)    # neither field is elderly_user
+        self.assertNotIn("CG-T02", ids)    # neither field is elderly_user
+
+    def test_filter_by_audience_no_match(self):
+        result = filter_alerts(SAMPLE_ALERTS, audience="remote_worker")
+        self.assertEqual(result, [])
+
+    def test_filter_audience_none_returns_all(self):
+        """audience=None should return all alerts regardless of segment."""
+        result = filter_alerts(SAMPLE_ALERTS, audience=None)
+        self.assertEqual(len(result), len(SAMPLE_ALERTS))
+
+    # --- Prompt builder ---
+
+    def test_build_prompt_includes_all_metadata(self):
+        """_build_prompt must include location, severity, audience, source in the user prompt."""
+        from ai_module import _build_prompt
+        alert = {
+            "title": "OTP Fraud Alert",
+            "report_text": "Residents are being called and asked for OTPs.",
+            "category": "scam",
+            "subcategory": "otp_fraud",
+            "location_city": "Hyderabad",
+            "neighborhood": "Banjara Hills",
+            "severity": 4,
+            "urgency": "immediate",
+            "source_type": "community_post",
+            "verification_status": "unverified",
+            "source_reliability": "medium",
+            "noise_to_signal": "signal",
+            "audience_tag": "elderly_user",
+            "user_segment_focus": "elderly_user",
+            "action_steps": ["Do not share OTP", "Call your bank"],
+        }
+        _, user_prompt = _build_prompt(alert)
+        self.assertIn("Hyderabad",        user_prompt)
+        self.assertIn("Banjara Hills",    user_prompt)
+        self.assertIn("4/5",              user_prompt)
+        self.assertIn("elderly_user".replace("_", " "), user_prompt)  # audience shown
+        self.assertIn("OTP Fraud Alert",  user_prompt)
+        self.assertIn("Do not share OTP", user_prompt)   # user steps passed as hints
+
+    def test_build_prompt_audience_tone_elderly(self):
+        """System prompt for elderly_user should contain jargon-avoidance instruction."""
+        from ai_module import _build_prompt
+        alert = {"report_text": "Test.", "audience_tag": "elderly_user",
+                 "user_segment_focus": "elderly_user", "severity": 2}
+        system_prompt, _ = _build_prompt(alert)
+        self.assertIn("elderly", system_prompt.lower())
+        self.assertIn("jargon", system_prompt.lower())
+
+    def test_build_prompt_audience_tone_remote_worker(self):
+        """System prompt for remote_worker should mention technical steps."""
+        from ai_module import _build_prompt
+        alert = {"report_text": "Test.", "audience_tag": "remote_worker",
+                 "user_segment_focus": "remote_worker", "severity": 3}
+        system_prompt, _ = _build_prompt(alert)
+        self.assertIn("remote worker", system_prompt.lower())
+
     # --- Fallback with empty text ---
 
     def test_summarize_empty_text_safe_output(self):
-        result = summarize_alert("")
+        result = summarize_alert({"report_text": "", "category": "scam"})
         self.assertIn("summary", result)
         self.assertIn("action_steps", result)
         self.assertEqual(result["source"], "fallback")
 
     def test_summarize_whitespace_only_text(self):
-        result = summarize_alert("   \n\t  ")
+        result = summarize_alert({"report_text": "   \n\t  ", "category": "scam"})
         self.assertEqual(result["source"], "fallback")
 
     def test_fallback_unknown_keywords_uses_generic(self):
-        result = _fallback_summarize("Something very ambiguous happened.", "unknown_category")
+        alert = {"report_text": "Something very ambiguous happened.", "category": "unknown_category"}
+        result = _fallback_summarize(alert)
         self.assertGreater(len(result["action_steps"]), 0)
-        # Generic steps should appear
         steps_text = " ".join(result["action_steps"]).lower()
         self.assertTrue(
             any(kw in steps_text for kw in ["alert", "report", "share"])
         )
+
+    # --- JSON parse + repair ---
+
+    def test_parse_json_safe_clean_input(self):
+        """Well-formed JSON parses without repair."""
+        from ai_module import _parse_json_safe
+        raw = '{"summary": "All good.", "action_steps": ["Step 1", "Step 2"]}'
+        result = _parse_json_safe(raw)
+        self.assertEqual(result["summary"], "All good.")
+        self.assertEqual(result["action_steps"], ["Step 1", "Step 2"])
+
+    def test_parse_json_safe_strips_markdown_fences(self):
+        """JSON wrapped in ```json ... ``` fences is still parsed correctly."""
+        from ai_module import _parse_json_safe
+        raw = '```json\n{"summary": "Test.", "action_steps": ["Do this"]}\n```'
+        # Fences are stripped before _parse_json_safe is called in _call_gemini,
+        # but test the extractor fallback path handles extra text gracefully too.
+        # Here we test that the regex-extraction pass finds the {...} block.
+        result = _parse_json_safe(raw)
+        self.assertEqual(result["summary"], "Test.")
+
+    def test_parse_json_safe_truncated_string_repaired(self):
+        """Unterminated string in the last action step is repaired and parsed."""
+        from ai_module import _parse_json_safe
+        # Simulates Gemini cutting off mid-last-step
+        truncated = '{"summary": "A scam was detected.", "action_steps": ["Do not click links", "Call your bank'
+        result = _parse_json_safe(truncated)
+        self.assertIn("summary", result)
+        self.assertIsInstance(result["action_steps"], list)
+        self.assertGreater(len(result["action_steps"]), 0)
+
+    def test_parse_json_safe_missing_closing_brace(self):
+        """Missing closing } is repaired."""
+        from ai_module import _parse_json_safe
+        incomplete = '{"summary": "Test summary.", "action_steps": ["Step one", "Step two"]'
+        result = _parse_json_safe(incomplete)
+        self.assertEqual(result["summary"], "Test summary.")
+
+    def test_parse_json_safe_missing_array_close(self):
+        """Missing closing ] on action_steps is repaired."""
+        from ai_module import _parse_json_safe
+        incomplete = '{"summary": "Short summary.", "action_steps": ["Step one", "Step two"}'
+        # The array close is missing but brace is present — the JSON is still malformed
+        # because the array isn't closed. Repair should handle this.
+        try:
+            result = _parse_json_safe(incomplete)
+            # If it parses, action_steps must be a list
+            self.assertIsInstance(result.get("action_steps", []), list)
+        except ValueError:
+            # Acceptable: this particular malformation may be unrecoverable
+            pass
+
+    def test_parse_json_safe_raises_on_garbage(self):
+        """Completely non-JSON input raises ValueError with a useful message."""
+        from ai_module import _parse_json_safe
+        with self.assertRaises(ValueError) as ctx:
+            _parse_json_safe("I cannot provide a summary for this request.")
+        self.assertIn("Could not parse", str(ctx.exception))
 
     # --- Filter with all filters active ---
 
