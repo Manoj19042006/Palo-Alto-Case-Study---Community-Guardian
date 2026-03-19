@@ -16,28 +16,24 @@ import re
 import textwrap
 from typing import Optional
 
-import google.generativeai as genai
 from dotenv import load_dotenv
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
-_MODEL_NAME = "gemini-1.5-flash"
-_CONFIGURED = False
+_MODEL_NAME = "gemini-2.5-flash"
 
 
-def _configure():
-    """Configure Gemini once; idempotent."""
-    global _CONFIGURED
-    if _CONFIGURED:
-        return
-    if _API_KEY:
-        genai.configure(api_key=_API_KEY)
-        _CONFIGURED = True
+def _get_api_key() -> Optional[str]:
+    """
+    Read the Gemini API key fresh on every call.
+    Re-runs load_dotenv() so changes to .env are picked up without restarting.
+    Returns None if the key is missing or blank.
+    """
+    load_dotenv(override=True)
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    return key if key else None
 
 
 # ---------------------------------------------------------------------------
@@ -57,17 +53,12 @@ _KEYWORD_RULES: list[tuple[list[str], str]] = [
 
 def _fallback_summarize(report_text: str, category: str = "") -> dict:
     """
-    Rule-based summarization when AI is unavailable.
+    Rule-based fallback when AI is unavailable.
 
-    Strategy:
-      1. Summary = first sentence (≤ 180 chars), cleaned up.
-      2. Action steps derived from keyword matching on report_text + category.
+    Does NOT generate a summary — extracting the first sentence would just
+    duplicate what the user already sees in the report text, adding no value.
+    Only produces keyword-matched action steps.
     """
-    # --- Summary: first sentence ---
-    sentences = re.split(r"(?<=[.!?])\s+", report_text.strip())
-    first = sentences[0] if sentences else report_text
-    summary = textwrap.shorten(first, width=180, placeholder="…")
-
     # --- Action steps: keyword matching ---
     text_lower = (report_text + " " + category).lower()
     matched_steps: list[str] = []
@@ -94,7 +85,7 @@ def _fallback_summarize(report_text: str, category: str = "") -> dict:
             unique_steps.append(step)
 
     return {
-        "summary": summary,
+        "summary": "",
         "action_steps": unique_steps[:5],
         "source": "fallback",
     }
@@ -159,40 +150,51 @@ _SYSTEM_PROMPT = textwrap.dedent("""
 
 
 def summarize_alert(report_text: str, category: str = "") -> dict:
+    """
+    Summarize an alert using Gemini API, with automatic fallback.
+
+    Returns:
+        {
+            "summary": str,
+            "action_steps": list[str],
+            "source": "AI" | "fallback",
+            "error": str | None   ← real error message if AI failed
+        }
+    """
     if not report_text or not report_text.strip():
         return {
-            "summary": "No report text available.",
+            "summary": "",
             "action_steps": ["Review the alert for more details."],
             "source": "fallback",
+            "error": None,
         }
 
-    if _API_KEY:
-        try:
-            result = _call_gemini(report_text)
+    api_key = _get_api_key()
 
-            # 🔥 FIX: validate AI output before accepting it
-            if (
-                not result.get("summary")
-                or len(result.get("summary", "").strip()) < 10
-                or not result.get("action_steps")
-            ):
-                raise ValueError("Weak AI response")
+    if not api_key:
+        result = _fallback_summarize(report_text, category)
+        result["error"] = "GEMINI_API_KEY is not set in your .env file."
+        return result
 
-            result["source"] = "AI"
-            return result
-
-        except Exception:
-            pass
-
-    return _fallback_summarize(report_text, category)
+    try:
+        result = _call_gemini(report_text, api_key)
+        result["source"] = "AI"
+        result["error"] = None
+        return result
+    except Exception as exc:
+        result = _fallback_summarize(report_text, category)
+        result["error"] = str(exc)
+        return result
 
 
-def _call_gemini(report_text: str) -> dict:
+def _call_gemini(report_text: str, api_key: str) -> dict:
     """
     Internal: call Gemini API and parse JSON response.
-    Raises on any failure so caller can catch and fallback.
+    Raises with a descriptive message on any failure.
     """
-    _configure()
+    import google.generativeai as genai  # imported here so missing package gives a clear error
+
+    genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
         model_name=_MODEL_NAME,
         system_instruction=_SYSTEM_PROMPT,
@@ -213,11 +215,10 @@ def _call_gemini(report_text: str) -> dict:
 
     parsed = json.loads(raw)
 
-    # Validate schema
     if "summary" not in parsed or "action_steps" not in parsed:
-        raise ValueError("Gemini response missing required keys.")
+        raise ValueError(f"Gemini returned unexpected JSON structure: {list(parsed.keys())}")
     if not isinstance(parsed["action_steps"], list):
-        raise ValueError("action_steps must be a list.")
+        raise ValueError("Gemini 'action_steps' field is not a list.")
 
     return {
         "summary": str(parsed["summary"]),

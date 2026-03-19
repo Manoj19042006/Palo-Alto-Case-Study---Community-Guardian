@@ -13,13 +13,10 @@ from utils import (
     validate_new_alert,
     build_new_alert,
     update_alert_status,
-    can_view_alert,
-    privacy_message,
     severity_badge,
     status_badge,
     VALID_CATEGORIES,
     SEVERITY_LABELS,
-    PRIVACY_LABELS,
 )
 from ai_module import summarize_alert
 
@@ -150,6 +147,15 @@ with st.sidebar:
         label_visibility="collapsed",
     )
 
+    st.divider()
+    st.subheader("🔑 API Status")
+    from ai_module import _get_api_key
+    if _get_api_key():
+        st.success("Gemini API key loaded ✓", icon="✅")
+    else:
+        st.error("No API key found in .env", icon="🔴")
+        st.caption("Set GEMINI_API_KEY in your .env file to enable AI summaries.")
+
 # ---------------------------------------------------------------------------
 # Header
 # ---------------------------------------------------------------------------
@@ -216,7 +222,6 @@ if page == "📊 Dashboard":
                 "Severity": a.get("severity", 1),
                 "Status": a.get("verification_status", ""),
                 "Signal": a.get("noise_to_signal", "").upper(),
-                "Privacy": PRIVACY_LABELS.get(a.get("privacy_mode", ""), ""),
             }
         )
 
@@ -255,29 +260,18 @@ if page == "📊 Dashboard":
                     🏙️ {chosen.get('location_city', '—')} &nbsp;|&nbsp;
                     📁 {chosen.get('category', '—').replace('_', ' ').title()} &nbsp;|&nbsp;
                     {severity_badge(sev)} &nbsp;|&nbsp;
-                    {status_badge(chosen.get('verification_status', ''))} &nbsp;|&nbsp;
-                    {PRIVACY_LABELS.get(chosen.get('privacy_mode', ''), '')}
+                    {status_badge(chosen.get('verification_status', ''))}
                 </small>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-        # Privacy gate
-        if not can_view_alert(chosen, viewer_role="public"):
-            st.warning(privacy_message(chosen))
-        else:
-            with st.expander("📄 Full Report Text", expanded=True):
-                st.write(chosen.get("report_text", "No text available."))
+        with st.expander("📄 Full Report Text", expanded=True):
+            st.write(chosen.get("report_text", "No text available."))
 
-        # -----------------------------
-        # 🔥 FIXED: AI ALWAYS AVAILABLE
-        # -----------------------------
+        # --- AI Summary ---
         st.subheader("🤖 AI Insights")
-
-        if not can_view_alert(chosen, viewer_role="public"):
-            st.info("🔐 Sensitive alert. AI summary generated without exposing full details.")
-
         alert_id = chosen.get("id", "")
 
         col_btn, col_src = st.columns([3, 1])
@@ -299,27 +293,36 @@ if page == "📊 Dashboard":
             cached = st.session_state.ai_cache.get(alert_id, {})
             src = cached.get("source", "fallback")
 
-            badge_cls = "badge-ai" if src == "AI" else "badge-fallback"
-            badge_label = "🤖 Gemini AI" if src == "AI" else "🔧 Rule-based Fallback"
-
-            st.markdown(
-                f'<span class="{badge_cls}">{badge_label}</span>',
-                unsafe_allow_html=True,
-            )
-
-            # 🔥 NEW: explicit fallback explanation
-            if src == "fallback":
-                st.info("⚠️ AI unavailable or low-confidence. Showing rule-based guidance.")
-
-            col_sum, col_act = st.columns(2)
-            with col_sum:
-                st.markdown("**📝 Summary**")
-                st.info(cached.get("summary", "—"))
-
-            with col_act:
-                st.markdown("**✅ Action Steps**")
-                for step in cached.get("action_steps", []):
-                    st.markdown(f"- {step}")
+            if src == "AI":
+                st.markdown(
+                    '<span class="badge-ai">🤖 Gemini AI</span>',
+                    unsafe_allow_html=True,
+                )
+                col_sum, col_act = st.columns(2)
+                with col_sum:
+                    st.markdown("**📝 AI Summary**")
+                    st.info(cached.get("summary", "—"))
+                with col_act:
+                    st.markdown("**✅ AI-Generated Action Steps**")
+                    for step in cached.get("action_steps", []):
+                        st.markdown(f"- {step}")
+            else:
+                st.markdown(
+                    '<span class="badge-fallback">🔧 Rule-based Fallback</span>',
+                    unsafe_allow_html=True,
+                )
+                error_msg = cached.get("error") or "Unknown error."
+                st.warning(
+                    f"⚠️ Gemini AI unavailable — falling back to rule-based suggestions.\n\n"
+                    f"**Reason:** `{error_msg}`"
+                )
+                steps = cached.get("action_steps", [])
+                if steps:
+                    st.markdown("**🔧 Rule-based Action Suggestions**")
+                    for step in steps:
+                        st.markdown(f"- {step}")
+                else:
+                    st.info("No keyword-matched suggestions found for this alert.")
 
         # Dataset-provided action steps
         if chosen.get("action_steps"):
@@ -355,11 +358,6 @@ elif page == "➕ Add Alert":
 
         with col2:
             f_severity = st.slider("Severity *", min_value=1, max_value=5, value=3)
-            f_privacy = st.selectbox(
-                "Privacy Mode",
-                list(PRIVACY_LABELS.keys()),
-                format_func=lambda x: PRIVACY_LABELS[x],
-            )
             f_audience = st.selectbox(
                 "Audience",
                 ["neighborhood_group", "remote_worker", "elderly_user", "general"],
@@ -376,7 +374,6 @@ elif page == "➕ Add Alert":
             "location_city": f_city,
             "neighborhood": f_neighborhood,
             "severity": f_severity,
-            "privacy_mode": f_privacy,
             "audience_tag": f_audience,
         }
 
