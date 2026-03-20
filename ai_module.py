@@ -126,7 +126,7 @@ def _build_prompt(alert: dict) -> tuple[str, str]:
 
         Overall tone principles:
         - Reduce anxiety, not increase it. Frame information as empowering.
-        - Be specific to the location and alert type where possible.
+        - Be specific to the alert type and category where possible.
         - Never exaggerate or dramatise.
         - If the source is unverified, acknowledge uncertainty briefly in the summary.
 
@@ -138,14 +138,11 @@ def _build_prompt(alert: dict) -> tuple[str, str]:
         }}
     """).strip()
 
-    # Structured user prompt with all alert metadata
+    # Structured user prompt — location and neighbourhood excluded (privacy)
     verification  = alert.get("verification_status", "unknown")
     reliability   = alert.get("source_reliability", "unknown")
     source_type   = alert.get("source_type", "unknown")
     source_line   = f"{source_type} — {verification} (reliability: {reliability})"
-
-    location_parts = [p for p in [alert.get("neighborhood", ""), alert.get("location_city", "")] if p]
-    location_str   = ", ".join(location_parts) if location_parts else "Unknown location"
 
     category       = alert.get("category", "").replace("_", " ")
     subcategory    = alert.get("subcategory", "").replace("_", " ")
@@ -159,7 +156,6 @@ def _build_prompt(alert: dict) -> tuple[str, str]:
         -------------
         Title       : {alert.get("title", "Untitled")}
         Category    : {category_str}
-        Location    : {location_str}
         Severity    : {severity}/5
         Urgency     : {urgency}
         Source      : {source_line}
@@ -632,16 +628,12 @@ def classify_alert(alert: dict) -> dict:
 
         category    = alert.get("category", "").replace("_", " ")
         subcategory = alert.get("subcategory", "").replace("_", " ")
-        location    = ", ".join(
-            p for p in [alert.get("neighborhood", ""), alert.get("location_city", "")] if p
-        ) or "Unknown"
 
         user_prompt = textwrap.dedent(f"""
             USER-SUBMITTED ALERT
             --------------------
             Title    : {alert.get("title", "Untitled")}
             Category : {category}{" / " + subcategory if subcategory else ""}
-            Location : {location}
             Severity : {alert.get("severity", 3)}/5
 
             REPORT TEXT

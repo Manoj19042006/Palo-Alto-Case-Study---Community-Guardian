@@ -151,14 +151,6 @@ with st.sidebar:
     if selected_category == "All categories":
         selected_category = None
 
-    # Audience
-    selected_audience = st.selectbox(
-        "Audience", ["All audiences"] + VALID_AUDIENCES,
-        format_func=lambda x: AUDIENCE_LABELS.get(x, x) if x != "All audiences" else x,
-    )
-    if selected_audience == "All audiences":
-        selected_audience = None
-
     # Severity range
     sev_range = st.slider("Severity range", min_value=1, max_value=5, value=(1, 5))
     st.divider()
@@ -200,7 +192,6 @@ filtered = filter_alerts(
     st.session_state.alerts,
     category=selected_category,
     city=selected_city,
-    audience=selected_audience,
     severity_min=sev_range[0],
     severity_max=sev_range[1],
     signal_only=True,
@@ -251,6 +242,9 @@ if page == "📊 Dashboard":
             "City":         a.get("location_city", ""),
             "Neighbourhood":a.get("neighborhood", "—") or "—",
             "Status":       a.get("verification_status", ""),
+            "Audience":     AUDIENCE_LABELS.get(
+                                a.get("audience_tag") or a.get("user_segment_focus", ""), "—"
+                            ),
         })
 
     st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)

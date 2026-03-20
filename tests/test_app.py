@@ -535,7 +535,8 @@ class TestEdgeCases(unittest.TestCase):
     # --- Prompt builder ---
 
     def test_build_prompt_includes_all_metadata(self):
-        """_build_prompt must include location, severity, audience, source in the user prompt."""
+        """_build_prompt must include severity, audience, source in the user prompt.
+        Location and neighbourhood are intentionally excluded for privacy."""
         from ai_module import _build_prompt
         alert = {
             "title": "OTP Fraud Alert",
@@ -555,12 +556,14 @@ class TestEdgeCases(unittest.TestCase):
             "action_steps": ["Do not share OTP", "Call your bank"],
         }
         _, user_prompt = _build_prompt(alert)
-        self.assertIn("Hyderabad",        user_prompt)
-        self.assertIn("Banjara Hills",    user_prompt)
+        # Location and neighbourhood must NOT be sent to LLM (privacy)
+        self.assertNotIn("Hyderabad",     user_prompt)
+        self.assertNotIn("Banjara Hills", user_prompt)
+        # Everything else must still be present
         self.assertIn("4/5",              user_prompt)
-        self.assertIn("elderly_user".replace("_", " "), user_prompt)  # audience shown
+        self.assertIn("elderly user",     user_prompt)
         self.assertIn("OTP Fraud Alert",  user_prompt)
-        self.assertIn("Do not share OTP", user_prompt)   # user steps passed as hints
+        self.assertIn("Do not share OTP", user_prompt)
 
     def test_build_prompt_audience_tone_elderly(self):
         """System prompt for elderly_user should contain jargon-avoidance instruction."""
