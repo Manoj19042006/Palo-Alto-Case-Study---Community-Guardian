@@ -4,6 +4,7 @@
 **Scenario Chosen:** 3 — Community Safety & Digital Wellness  
 **Estimated Time Spent:** 5 hours
 
+**Youtube Link:** https://youtu.be/58QV9HET8ug
 ---
 
 ## Quick Start
@@ -22,6 +23,9 @@ cp .env.example .env
 ### Run Commands
 
 ```bash
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
 streamlit run app.py
 ```
 
